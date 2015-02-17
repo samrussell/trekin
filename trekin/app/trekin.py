@@ -23,19 +23,49 @@ from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet, ipv4, udp, dhcp, arp
 from ryu.lib import addrconv
 
+import json
 
-class SimpleSwitch13(app_manager.RyuApp):
+
+class Trekin(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
     _CONTEXTS = {'switches': switches.Switches}
 
     def __init__(self, *args, **kwargs):
-        super(SimpleSwitch13, self).__init__(*args, **kwargs)
+        super(Trekin, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
         self.dhcp_leases = {}
         # add special case
         self.dhcp_leases['00:16:3e:f2:d9:d3'] = {'ipaddr':'10.1.1.1', 'port' : 3}
         # test data
         self.ips = set(['10.1.1.2', '10.1.1.3', '10.1.1.4', '10.1.1.5', '10.1.1.6'])
+
+        # try to get leases and ips from file
+        dump = None
+        try:
+            dump = open('/state/dump')
+        except IOError:
+            pass
+        if dump:
+            data = dump.read()
+            datadict = json.loads(data)
+            self.dhcp_leases = datadict['dhcp_leases']
+            self.ips = set(datadict['ips'])
+    
+    def add_lease(self, mac, ipaddr, port):
+        self.dhcp_leases[mac] = {'ipaddr' : ipaddr, 'port' : port}
+        data = json.dumps({'dhcp_leases' : self.dhcp_leases, 'ips' : list(self.ips)})
+        open('/state/dump', 'w').write(data)
+
+    def insert_ip_rule(self, datapath, ofproto, parser, in_port, src, ipaddr):
+        match = parser.OFPMatch(
+                                  eth_type = 0x0800,  # IP
+                                  eth_dst = "00:12:34:56:78:90",
+                                  ipv4_dst = ipaddr 
+                                  )
+        actions = [parser.OFPActionSetField(eth_src="00:12:34:56:78:90"),
+                    parser.OFPActionSetField(eth_dst=src),
+                    parser.OFPActionOutput(in_port)]
+        self.add_flow(datapath, 5, match, actions)
 
     @set_ev_cls(event.EventSwitchEnter, MAIN_DISPATCHER)
     def switch_enter(self, ev):
@@ -74,6 +104,12 @@ class SimpleSwitch13(app_manager.RyuApp):
                                               ofproto.OFPCML_NO_BUFFER)]
             self.add_flow(datapath, 0, match, actions)
 
+            # replace ip flows
+            for lease in self.dhcp_leases.iteritems():
+                src = lease[0]
+                ipaddr = lease[1]['ipaddr']
+                in_port = lease[1]['port']
+                self.insert_ip_rule(datapath, ofproto, parser, in_port, src, ipaddr)
 
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -202,7 +238,8 @@ class SimpleSwitch13(app_manager.RyuApp):
                 ipaddr = self.dhcp_leases[src]['ipaddr']
             else:
                 ipaddr = self.ips.pop()
-                self.dhcp_leases[src] = {'ipaddr' : ipaddr, 'port' : in_port}
+                self.add_lease(src, ipaddr, in_port)
+                #self.dhcp_leases[src] = {'ipaddr' : ipaddr, 'port' : in_port}
             print "Assigning IP %s to mac %s on port %s" % (ipaddr, src, in_port)
             print "Replying to DHCP discover"
             option_list = [
@@ -245,15 +282,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             #                parser.OFPActionOutput(3)]
             #    self.add_flow(datapath, 6, match, actions)
 
-            match = parser.OFPMatch(
-                                      eth_type = 0x0800,  # IP
-                                      eth_dst = "00:12:34:56:78:90",
-                                      ipv4_dst = ipaddr 
-                                      )
-            actions = [parser.OFPActionSetField(eth_src="00:12:34:56:78:90"),
-                        parser.OFPActionSetField(eth_dst=src),
-                        parser.OFPActionOutput(in_port)]
-            self.add_flow(datapath, 5, match, actions)
+            self.insert_ip_rule(datapath, ofproto, parser, in_port, src, ipaddr)
 
 
             print "Replying to DHCP request"

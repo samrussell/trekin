@@ -1,5 +1,9 @@
 FROM ubuntu:14.04
 
+ADD tmp /tmp
+
+RUN cp /tmp/sources.list /etc/apt/
+
 RUN apt-get update
 RUN apt-get install -y python
 RUN apt-get install -y python-dev
