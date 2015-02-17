@@ -32,6 +32,10 @@ class SimpleSwitch13(app_manager.RyuApp):
         super(SimpleSwitch13, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
         self.dhcp_leases = {}
+        # add special case
+        self.dhcp_leases['00:16:3e:f2:d9:d3'] = {'ipaddr':'10.1.1.1', 'port' : 3}
+        # test data
+        self.ips = set(['10.1.1.2', '10.1.1.3', '10.1.1.4', '10.1.1.5', '10.1.1.6'])
 
     @set_ev_cls(event.EventSwitchEnter, MAIN_DISPATCHER)
     def switch_enter(self, ev):
@@ -42,7 +46,13 @@ class SimpleSwitch13(app_manager.RyuApp):
         print "Datapath: %s" % datapath.id
         # if datapath = 1 then we're awesome
         if datapath.id == 1:
-            print "datapath 1 woohoo"
+            print "datapath 1 - this is ours"
+            # clear flows
+            mod = parser.OFPFlowMod(datapath, 0, 0, 0, ofproto.OFPFC_DELETE,
+                                    0, 0, 1, ofproto.OFPCML_NO_BUFFER,
+                                    ofproto.OFPP_ANY, ofproto.OFPG_ANY, 0,
+                                    parser.OFPMatch(), [])
+            datapath.send_msg(mod)
             # punch out dhcp flow
             match = parser.OFPMatch(
                                       eth_type = 0x0800,  # IPv4
@@ -52,6 +62,17 @@ class SimpleSwitch13(app_manager.RyuApp):
             actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                               ofproto.OFPCML_NO_BUFFER)]
             self.add_flow(datapath, 10, match, actions)
+            # punch out arp flow
+            match = parser.OFPMatch(
+                                      eth_type = 0x0806,  # ARP
+                                      )
+            actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                              ofproto.OFPCML_NO_BUFFER)]
+            self.add_flow(datapath, 10, match, actions)
+            match = parser.OFPMatch()
+            actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                              ofproto.OFPCML_NO_BUFFER)]
+            self.add_flow(datapath, 0, match, actions)
 
 
 
@@ -68,10 +89,10 @@ class SimpleSwitch13(app_manager.RyuApp):
         # 128, OVS will send Packet-In with invalid buffer_id and
         # truncated packet data. In that case, we cannot output packets
         # correctly.  The bug has been fixed in OVS v2.1.0.
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                          ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, 0, match, actions)
+        #match = parser.OFPMatch()
+        #actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+        #                                  ofproto.OFPCML_NO_BUFFER)]
+        #self.add_flow(datapath, 0, match, actions)
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
@@ -128,6 +149,10 @@ class SimpleSwitch13(app_manager.RyuApp):
                     return
 
         arp_pkt = pkt.get_protocol(arp.arp)
+        if arp_pkt:
+            print "arp packet"
+            self.handle_arp(datapath, ofproto, parser, in_port, src, arp_pkt)
+            return
 
         # learn a mac address to avoid FLOOD next time.
         self.mac_to_port[dpid][src] = in_port
@@ -174,10 +199,11 @@ class SimpleSwitch13(app_manager.RyuApp):
             # look up MAC address in dhcp_leases
             ipaddr = None
             if src in self.dhcp_leases:
-                ipaddr = self.dhcp_leases[src]
+                ipaddr = self.dhcp_leases[src]['ipaddr']
             else:
-                ipaddr = "10.1.1.3" # for giggles
-                self.dhcp_leases[src] = ipaddr
+                ipaddr = self.ips.pop()
+                self.dhcp_leases[src] = {'ipaddr' : ipaddr, 'port' : in_port}
+            print "Assigning IP %s to mac %s on port %s" % (ipaddr, src, in_port)
             print "Replying to DHCP discover"
             option_list = [
                             dhcp.option(tag=53, value='\x02'),
@@ -204,10 +230,32 @@ class SimpleSwitch13(app_manager.RyuApp):
                 self.dhcp_reply(datapath, ofproto, parser, in_port, src, dhcp_pkt, '0.0.0.0', option_list)
                 return
             reqipaddr = addrconv.ipv4.bin_to_text(requests[0].value)
-            ipaddr = self.dhcp_leases[src]
+            ipaddr = self.dhcp_leases[src]['ipaddr']
             if ipaddr != reqipaddr:
                 print "client requesting wrong address: %s (should be %s)" % (reqipaddr, ipaddr)
                 return
+            print "Add flow for new IP %s" % ipaddr
+            # you can force LAN traffic to go through a firewall if you want
+            #if in_port != 3:
+            #    match = parser.OFPMatch(
+            #                            in_port = in_port
+            #                              )
+            #    actions = [parser.OFPActionSetField(eth_src="00:12:34:56:78:90"),
+            #                parser.OFPActionSetField(eth_dst="00:16:3e:f2:d9:d3"),
+            #                parser.OFPActionOutput(3)]
+            #    self.add_flow(datapath, 6, match, actions)
+
+            match = parser.OFPMatch(
+                                      eth_type = 0x0800,  # IP
+                                      eth_dst = "00:12:34:56:78:90",
+                                      ipv4_dst = ipaddr 
+                                      )
+            actions = [parser.OFPActionSetField(eth_src="00:12:34:56:78:90"),
+                        parser.OFPActionSetField(eth_dst=src),
+                        parser.OFPActionOutput(in_port)]
+            self.add_flow(datapath, 5, match, actions)
+
+
             print "Replying to DHCP request"
             option_list = [
                             dhcp.option(tag=53, value='\x05'),
@@ -242,6 +290,44 @@ class SimpleSwitch13(app_manager.RyuApp):
         pkt.serialize()
         data = pkt.data
         actions = [parser.OFPActionOutput(port=in_port)]
+        out = parser.OFPPacketOut(datapath=datapath,
+                                  buffer_id=ofproto.OFP_NO_BUFFER,
+                                  in_port=ofproto.OFPP_CONTROLLER,
+                                  actions=actions,
+                                  data=data)
+        datapath.send_msg(out)
+
+    def handle_arp(self, datapath, ofproto, parser, in_port, src, arp_pkt):
+        if arp_pkt.opcode == arp.ARP_REQUEST:
+            print "ARP request"
+            # reply on behalf of lease
+            macs = [x[0] for x in self.dhcp_leases.iteritems() if x[1]['ipaddr'] == arp_pkt.dst_ip]
+            if len(macs) != 1:
+                print "Looking for IP %s... not found" % arp_pkt.dst_ip
+                return
+            mac = macs[0]
+            print "Looking for IP %s... MAC is %s" % (arp_pkt.dst_ip, mac)
+            print "Insert our MAC instead"
+
+            pkt = packet.Packet()
+            pkt.add_protocol(ethernet.ethernet(ethertype=0x0806,
+                                                dst=src,
+                                                src="00:12:34:56:78:90")
+                                                )
+            pkt.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
+                                      src_mac="00:12:34:56:78:90",
+                                      src_ip=arp_pkt.dst_ip,
+                                      dst_mac=arp_pkt.src_mac,
+                                      dst_ip=arp_pkt.src_ip)
+                                      )
+            self.send_packet(datapath, parser, ofproto, in_port, pkt)
+            print "Sent ARP reply"
+
+    
+    def send_packet(self, datapath, parser, ofproto, port, pkt):
+        pkt.serialize()
+        data = pkt.data
+        actions = [parser.OFPActionOutput(port=port)]
         out = parser.OFPPacketOut(datapath=datapath,
                                   buffer_id=ofproto.OFP_NO_BUFFER,
                                   in_port=ofproto.OFPP_CONTROLLER,
