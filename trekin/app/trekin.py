@@ -65,6 +65,7 @@ class Trekin(app_manager.RyuApp):
         open('/state/dump', 'w').write(data)
 
     def insert_ip_rule(self, datapath, ofproto, parser, in_port, src, ipaddr):
+        # add flow to match egress to this IP
         match = parser.OFPMatch(
                                   eth_type = 0x0800,  # IP
                                   eth_dst = "00:12:34:56:78:90",
@@ -73,7 +74,15 @@ class Trekin(app_manager.RyuApp):
         actions = [parser.OFPActionSetField(eth_src="00:12:34:56:78:90"),
                     parser.OFPActionSetField(eth_dst=src),
                     parser.OFPActionOutput(in_port)]
-        self.add_flow(datapath, 5, match, actions)
+        self.add_flow(datapath, 5, match, actions, table_id=2)
+        # add flow to allow ingress from this IP
+        match = parser.OFPMatch(
+                                  eth_type = 0x0800,  # IP
+                                  eth_dst = "00:12:34:56:78:90",
+                                  ipv4_src = ipaddr 
+                                  )
+        inst = [parser.OFPInstructionGotoTable(2)]
+        self.add_instruction(datapath, 5, match, inst, table_id=1)
 
     @set_ev_cls(event.EventSwitchEnter, MAIN_DISPATCHER)
     def switch_enter(self, ev):
@@ -86,7 +95,7 @@ class Trekin(app_manager.RyuApp):
         if datapath.id == 1:
             print "datapath 1 - this is ours"
             # clear flows
-            mod = parser.OFPFlowMod(datapath, 0, 0, 0, ofproto.OFPFC_DELETE,
+            mod = parser.OFPFlowMod(datapath, 0, 0, ofproto.OFPTT_ALL, ofproto.OFPFC_DELETE,
                                     0, 0, 1, ofproto.OFPCML_NO_BUFFER,
                                     ofproto.OFPP_ANY, ofproto.OFPG_ANY, 0,
                                     parser.OFPMatch(), [])
@@ -108,9 +117,12 @@ class Trekin(app_manager.RyuApp):
                                               ofproto.OFPCML_NO_BUFFER)]
             self.add_flow(datapath, 10, match, actions)
             match = parser.OFPMatch()
-            actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                              ofproto.OFPCML_NO_BUFFER)]
-            self.add_flow(datapath, 0, match, actions)
+            inst = [parser.OFPInstructionGotoTable(1)]
+            self.add_instruction(datapath, 0, match, inst, table_id=0)
+            #match = parser.OFPMatch()
+            #actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+            #                                  ofproto.OFPCML_NO_BUFFER)]
+            #self.add_flow(datapath, 0, match, actions, table_id=1)
 
             # replace ip flows
             for lease in self.dhcp_leases.iteritems():
@@ -138,20 +150,28 @@ class Trekin(app_manager.RyuApp):
         #                                  ofproto.OFPCML_NO_BUFFER)]
         #self.add_flow(datapath, 0, match, actions)
 
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
+    def add_instruction(self, datapath, priority, match, inst, buffer_id=None, table_id=0):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        if buffer_id:
+            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
+                                    table_id=table_id,
+                                    priority=priority, match=match,
+                                    instructions=inst)
+        else:
+            mod = parser.OFPFlowMod(datapath=datapath, table_id=table_id,
+                                    priority=priority,
+                                    match=match, instructions=inst)
+        datapath.send_msg(mod)
+
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None, table_id=0):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
                                              actions)]
-        if buffer_id:
-            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                    priority=priority, match=match,
-                                    instructions=inst)
-        else:
-            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                    match=match, instructions=inst)
-        datapath.send_msg(mod)
+        self.add_instruction(datapath, priority, match, inst, buffer_id, table_id)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
@@ -198,33 +218,6 @@ class Trekin(app_manager.RyuApp):
             self.handle_arp(datapath, ofproto, parser, in_port, src, arp_pkt)
             return
 
-        # learn a mac address to avoid FLOOD next time.
-        self.mac_to_port[dpid][src] = in_port
-
-        if dst in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst]
-        else:
-            out_port = ofproto.OFPP_FLOOD
-
-        actions = [parser.OFPActionOutput(out_port)]
-
-        # install a flow to avoid packet_in next time
-        if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
-            # verify if we have a valid buffer_id, if yes avoid to send both
-            # flow_mod & packet_out
-            if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                self.add_flow(datapath, 1, match, actions, msg.buffer_id)
-                return
-            else:
-                self.add_flow(datapath, 1, match, actions)
-        data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-            data = msg.data
-
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                  in_port=in_port, actions=actions, data=data)
-        datapath.send_msg(out)
 
     # handle_dhcp(datapath, ofproto, parser, in_port, dhcp_pkt)
     def handle_dhcp(self, datapath, ofproto, parser, in_port, src, dhcp_pkt):
