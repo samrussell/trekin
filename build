@@ -1,2 +1,1 @@
-docker build -t pipbase ryu/
 docker build -t trekin trekin/
