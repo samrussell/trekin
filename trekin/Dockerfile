@@ -1,4 +1,4 @@
-FROM pipbase
+FROM osrg/ryu
 ADD app /app
 WORKDIR /app
 EXPOSE 6633
