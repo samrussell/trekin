@@ -116,6 +116,14 @@ class Trekin(app_manager.RyuApp):
             actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                               ofproto.OFPCML_NO_BUFFER)]
             self.add_flow(datapath, 10, match, actions)
+            # punch out EAPOL flow
+            match = parser.OFPMatch(
+                                      eth_type = 0x888e,  # EAPOL
+                                      )
+            actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                              ofproto.OFPCML_NO_BUFFER)]
+            self.add_flow(datapath, 10, match, actions)
+            # default flow
             match = parser.OFPMatch()
             inst = [parser.OFPInstructionGotoTable(1)]
             self.add_instruction(datapath, 0, match, inst, table_id=0)
@@ -217,6 +225,9 @@ class Trekin(app_manager.RyuApp):
             print "arp packet"
             self.handle_arp(datapath, ofproto, parser, in_port, src, arp_pkt)
             return
+        # do eapol the dirty way
+        if eth.ethertype == 0x888e:
+            print "EAPOL packet"
 
 
     # handle_dhcp(datapath, ofproto, parser, in_port, dhcp_pkt)
